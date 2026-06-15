@@ -17,7 +17,7 @@ def parse_args():
     parser.add_argument("--server", type=str, default="localhost", help="IP address or domain of the remote GPU server.")
     parser.add_argument("--port", type=int, default=8000, help="Port of the remote GPU server.")
     parser.add_argument("--secure", action="store_true", help="Use secure HTTPS/WSS connections.")
-    parser.add_argument("--protocol", type=str, choices=["webrtc", "websockets"], default="webrtc", help="Streaming protocol to use: webrtc or websockets (default: webrtc).")
+    parser.add_argument("--protocol", type=str, choices=["webrtc", "websockets"], default="websockets", help="Streaming protocol to use: webrtc or websockets (default: websockets).")
     parser.add_argument("--camera", type=int, default=0, help="Local webcam device index (default: 0).")
     parser.add_argument("--target", type=str, default="", help="Path to the local character image (JPEG/PNG) to swap with.")
     parser.add_argument("--width", type=int, default=640, help="Webcam capture width (default: 640).")
