@@ -133,10 +133,16 @@ async def streaming_loop(args):
                         
                 # Render local preview window (requires BGR format)
                 if not args.no_preview:
-                    cv2.imshow("Remote GPU Face-Swap Preview", swapped_frame)
-                    # Use a tiny waitkey to allow OpenCV to pump window events
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+                    try:
+                        cv2.imshow("Remote GPU Face-Swap Preview", swapped_frame)
+                        # Use a tiny waitkey to allow OpenCV to pump window events
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
+                    except cv2.error:
+                        print("\nWARNING: Local GUI preview window is not supported in this environment.")
+                        print("Disabling preview and running in background-only mode.")
+                        print("To run cleanly without GUI, use the '--no-preview' flag.")
+                        args.no_preview = True
                 else:
                     # If preview is disabled, run a tiny yield to prevent thread lock
                     await asyncio.sleep(0.001)
@@ -148,7 +154,10 @@ async def streaming_loop(args):
         cap.release()
         if vcam is not None:
             vcam.close()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         print("Streaming closed. Cleanup complete.")
 
 async def main():
