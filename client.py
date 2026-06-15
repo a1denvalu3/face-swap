@@ -7,11 +7,13 @@ import argparse
 import sys
 import os
 import pyvirtualcam
+from urllib.parse import urlparse
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Client for remote GPU accelerated face-swapping.")
     parser.add_argument("--server", type=str, default="localhost", help="IP address or domain of the remote GPU server.")
     parser.add_argument("--port", type=int, default=8000, help="Port of the remote GPU server.")
+    parser.add_argument("--secure", action="store_true", help="Use secure HTTPS/WSS connections.")
     parser.add_argument("--camera", type=int, default=0, help="Local webcam device index (default: 0).")
     parser.add_argument("--target", type=str, default="", help="Path to the local character image (JPEG/PNG) to swap with.")
     parser.add_argument("--width", type=int, default=640, help="Webcam capture width (default: 640).")
@@ -20,13 +22,12 @@ def parse_args():
     parser.add_argument("--no-preview", action="store_true", help="Disable the local OpenCV preview window.")
     return parser.parse_args()
 
-async def upload_target_face(server_ip, port, image_path):
+async def upload_target_face(url, image_path):
     """Uploads the local target character image to the server."""
     if not os.path.exists(image_path):
         print(f"ERROR: Target image path does not exist: {image_path}")
         sys.exit(1)
         
-    url = f"http://{server_ip}:{port}/set_target"
     print(f"Uploading target character face {image_path} to {url}...")
     
     try:
@@ -50,7 +51,7 @@ async def upload_target_face(server_ip, port, image_path):
         print(f"CONNECTION ERROR during upload: {e}")
         return False
 
-async def streaming_loop(args):
+async def streaming_loop(args, websocket_url):
     # Set up OpenCV webcam capture
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -85,7 +86,6 @@ async def streaming_loop(args):
         print("The program will continue using local preview window only.")
         print("="*60 + "\n")
         
-    websocket_url = f"ws://{args.server}:{args.port}/swap"
     print(f"Connecting to face-swapping stream at {websocket_url}...")
     
     # Establish persistent WebSocket connection
@@ -160,17 +160,49 @@ async def streaming_loop(args):
             pass
         print("Streaming closed. Cleanup complete.")
 
+def resolve_urls(args):
+    server_input = args.server
+    
+    # Check if a scheme is already present
+    if "://" in server_input:
+        parsed = urlparse(server_input)
+        scheme = parsed.scheme
+        host = parsed.netloc
+    else:
+        scheme = "https" if (args.secure or "cloudflare" in server_input) else "http"
+        host = server_input
+
+    # Strip any port from host if user specified port separately
+    if ":" in host:
+        host_parts = host.split(":")
+        host = host_parts[0]
+        port = int(host_parts[1])
+    else:
+        port = args.port
+
+    # Build base HTTP and WebSocket URLs
+    if (scheme == "https" and port == 443) or (scheme == "http" and port == 80) or ("cloudflare" in host):
+        # Cloudflare tunnels do not expose custom ports on their public URLs, so we omit port
+        http_url = f"{scheme}://{host}/set_target"
+        ws_url = f"{'wss' if scheme == 'https' else 'ws'}://{host}/swap"
+    else:
+        http_url = f"{scheme}://{host}:{port}/set_target"
+        ws_url = f"{'wss' if scheme == 'https' else 'ws'}://{host}:{port}/swap"
+        
+    return http_url, ws_url
+
 async def main():
     args = parse_args()
+    http_url, ws_url = resolve_urls(args)
     
     # If a target character image is specified, upload it first via HTTP
     if args.target:
-        success = await upload_target_face(args.server, args.port, args.target)
+        success = await upload_target_face(http_url, args.target)
         if not success:
             print("WARNING: Target face upload failed. Streaming anyway (will not swap until a target is set).")
             
     # Start the real-time webcam stream
-    await streaming_loop(args)
+    await streaming_loop(args, ws_url)
 
 if __name__ == "__main__":
     try:
