@@ -11,6 +11,7 @@ import asyncio
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 import av
 from pydantic import BaseModel
+import time
 
 import insightface
 from insightface.app import FaceAnalysis
@@ -261,9 +262,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_bytes(data)
                 continue
                 
+            t_start = time.time()
             # Detect faces on the webcam frame
             faces = face_analyser.get(img)
+            t_det = time.time() - t_start
             
+            t_swap_start = time.time()
             if len(faces) > 0:
                 # Swap every detected face with our target character face
                 swapped_img = img.copy()
@@ -271,6 +275,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     swapped_img = swapper.get(swapped_img, face, target_face_object, paste_back=True)
             else:
                 swapped_img = img
+            t_swap = time.time() - t_swap_start
+            print(f"Server Proc: Det={1000*t_det:.1f}ms, Swap={1000*t_swap:.1f}ms")
                 
             # Re-encode the swapped frame back to JPEG to minimize network payload size
             # Quality of 85 balances visual fidelity and payload size perfectly
