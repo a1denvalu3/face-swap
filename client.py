@@ -148,10 +148,17 @@ async def websocket_loop(args, websocket_url):
             stop_event = asyncio.Event()
             frame_count = 0
             t_start = time.time()
+            in_flight_count = 0
             
             # Define Sender Task
             async def sender():
+                nonlocal in_flight_count
                 while not stop_event.is_set():
+                    # Limit the maximum number of frames in flight to 3 to prevent queue build-up and RTT bloat
+                    if in_flight_count >= 3:
+                        await asyncio.sleep(0.005)
+                        continue
+                        
                     t_grab_start = time.time()
                     ret, frame = cap.read()
                     if not ret:
@@ -169,6 +176,7 @@ async def websocket_loop(args, websocket_url):
                     
                     try:
                         await ws.send(encoded_img.tobytes())
+                        in_flight_count += 1
                     except Exception as e:
                         print(f"Send error: {e}")
                         stop_event.set()
@@ -181,16 +189,13 @@ async def websocket_loop(args, websocket_url):
 
             # Define Receiver Task
             async def receiver():
-                nonlocal frame_count, t_start
-                accum_decode = 0
-                accum_vcam = 0
-                accum_preview = 0
+                nonlocal frame_count, t_start, in_flight_count
                 
                 while not stop_event.is_set():
                     try:
                         response_data = await ws.recv()
+                        in_flight_count = max(0, in_flight_count - 1)
                         
-                        t_dec_start = time.time()
                         # Decode swapped JPEG back to OpenCV frame
                         np_arr = np.frombuffer(response_data, dtype=np.uint8)
                         swapped_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -202,9 +207,6 @@ async def websocket_loop(args, websocket_url):
                         else:
                             continue
                             
-                        t_dec_end = time.time()
-                        accum_decode += (t_dec_end - t_dec_start)
-                        
                         # Write to system's Virtual Camera
                         if vcam is not None:
                             try:
@@ -213,8 +215,6 @@ async def websocket_loop(args, websocket_url):
                                 vcam.sleep_until_next_frame()
                             except Exception as e:
                                 print(f"Virtual camera write error: {e}")
-                        t_vcam_end = time.time()
-                        accum_vcam += (t_vcam_end - t_dec_end)
                         
                         # Render local preview window
                         if not args.no_preview:
@@ -230,22 +230,13 @@ async def websocket_loop(args, websocket_url):
                                 args.no_preview = True
                         else:
                             await asyncio.sleep(0.001)
-                        accum_preview += (time.time() - t_vcam_end)
                         
                         frame_count += 1
                         if frame_count >= 30:
                             fps = frame_count / (time.time() - t_start)
-                            print(f"\n--- Live Receiving FPS: {fps:.2f} ---")
-                            print(f"JPEG Decode:   {accum_decode/frame_count*1000:.2f}ms")
-                            print(f"Virtual Cam:   {accum_vcam/frame_count*1000:.2f}ms")
-                            print(f"GUI Preview:   {accum_preview/frame_count*1000:.2f}ms")
-                            print("-------------------------------\n")
-                            
+                            print(f"Streaming FPS: {fps:.1f}")
                             frame_count = 0
                             t_start = time.time()
-                            accum_decode = 0
-                            accum_vcam = 0
-                            accum_preview = 0
                             
                     except Exception as e:
                         print(f"Receive error: {e}")
