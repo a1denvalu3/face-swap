@@ -70,7 +70,15 @@ def startup_event():
     # Initialize the swapper model
     if os.path.exists(MODEL_PATH):
         try:
-            swapper = insightface.model_zoo.get_model(MODEL_PATH, download=False, download_zip=False)
+            if 'CUDAExecutionProvider' in available_providers:
+                # Force swapper model to run on the GPU using a manual InferenceSession
+                print("Forcing GPU execution for the Face Swapper model...")
+                sess_options = ort.SessionOptions()
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess = ort.InferenceSession(MODEL_PATH, sess_options, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+                swapper = insightface.model_zoo.get_model(MODEL_PATH, download=False, download_zip=False, session=sess)
+            else:
+                swapper = insightface.model_zoo.get_model(MODEL_PATH, download=False, download_zip=False)
             print("Face Swapper model loaded successfully.")
         except Exception as e:
             print(f"Error loading Face Swapper model: {e}")

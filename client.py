@@ -7,6 +7,8 @@ import argparse
 import sys
 import os
 import pyvirtualcam
+import threading
+import time
 from urllib.parse import urlparse
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 import av
@@ -25,6 +27,54 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30, help="Webcam target FPS (default: 30).")
     parser.add_argument("--no-preview", action="store_true", help="Disable the local OpenCV preview window.")
     return parser.parse_args()
+
+class ThreadedCamera:
+    def __init__(self, src=0, width=640, height=480, fps=30):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        
+        self.grabbed, self.frame = self.cap.read()
+        self.started = False
+        self.read_lock = threading.Lock()
+
+    def start(self):
+        if self.started:
+            return self
+        self.started = True
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+        return self
+
+    def update(self):
+        while self.started:
+            grabbed, frame = self.cap.read()
+            if grabbed:
+                with self.read_lock:
+                    self.grabbed = grabbed
+                    self.frame = frame
+            else:
+                time.sleep(0.005)
+
+    def read(self):
+        with self.read_lock:
+            frame = self.frame.copy() if self.frame is not None else None
+            grabbed = self.grabbed
+        return grabbed, frame
+
+    def get(self, prop):
+        return self.cap.get(prop)
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self.started = False
+        if hasattr(self, "thread"):
+            self.thread.join(timeout=1.0)
+        self.cap.release()
 
 async def upload_target_face(url, image_path):
     """Uploads the local target character image to the server."""
@@ -57,10 +107,7 @@ async def upload_target_face(url, image_path):
 
 async def websocket_loop(args, websocket_url):
     # Set up OpenCV webcam capture
-    cap = cv2.VideoCapture(args.camera)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    cap = ThreadedCamera(args.camera, args.width, args.height, args.fps).start()
     
     # Retrieve actual resolution set by OpenCV
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -228,10 +275,7 @@ async def display_swapped_track(track, vcam, args, stop_event):
 
 async def webrtc_loop(args, offer_url):
     # Set up OpenCV webcam capture
-    cap = cv2.VideoCapture(args.camera)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    cap = ThreadedCamera(args.camera, args.width, args.height, args.fps).start()
     
     # Retrieve actual resolution set by OpenCV
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
