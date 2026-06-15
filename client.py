@@ -145,26 +145,49 @@ async def websocket_loop(args, websocket_url):
             print("Connected to remote GPU swapper! Streaming started...")
             print("Press 'q' in the preview window to exit.")
             
+            frame_count = 0
+            t_start = time.time()
+            
+            accum_grab = 0
+            accum_compress = 0
+            accum_net = 0
+            accum_decode = 0
+            accum_vcam = 0
+            accum_preview = 0
+            
             while True:
+                t0 = time.time()
                 ret, frame = cap.read()
+                t1 = time.time()
+                accum_grab += (t1 - t0)
+                
                 if not ret:
                     print("Failed to grab frame from webcam.")
                     await asyncio.sleep(0.01)
                     continue
                     
+                t2 = time.time()
                 # Compress the raw frame to JPEG to minimize upload upload bandwidth and latency
                 _, encoded_img = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                t3 = time.time()
+                accum_compress += (t3 - t2)
                 
                 try:
+                    t4 = time.time()
                     # Send binary JPEG frame to cloud
                     await ws.send(encoded_img.tobytes())
                     
                     # Receive swapped binary JPEG frame from cloud
                     response_data = await ws.recv()
+                    t5 = time.time()
+                    accum_net += (t5 - t4)
                     
+                    t6 = time.time()
                     # Decode swapped JPEG back to OpenCV frame
                     np_arr = np.frombuffer(response_data, dtype=np.uint8)
                     swapped_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                    t7 = time.time()
+                    accum_decode += (t7 - t6)
                     
                     if swapped_frame is None:
                         swapped_frame = frame  # Fallback to original frame if decoding failed
@@ -173,6 +196,7 @@ async def websocket_loop(args, websocket_url):
                     print(f"Stream frame transmission error: {e}")
                     swapped_frame = frame  # Fallback to original
                     
+                t8 = time.time()
                 # Write to the system's Virtual Camera (requires RGB format)
                 if vcam is not None:
                     try:
@@ -181,7 +205,10 @@ async def websocket_loop(args, websocket_url):
                         vcam.sleep_until_next_frame()
                     except Exception as e:
                         print(f"Virtual camera write error: {e}")
-                        
+                t9 = time.time()
+                accum_vcam += (t9 - t8)
+                
+                t10 = time.time()
                 # Render local preview window (requires BGR format)
                 if not args.no_preview:
                     try:
@@ -195,8 +222,30 @@ async def websocket_loop(args, websocket_url):
                         print("To run cleanly without GUI, use the '--no-preview' flag.")
                         args.no_preview = True
                 else:
-                    # If preview is disabled, run a tiny yield to prevent thread lock
                     await asyncio.sleep(0.001)
+                t11 = time.time()
+                accum_preview += (t11 - t10)
+                
+                frame_count += 1
+                if frame_count >= 30:
+                    fps = frame_count / (time.time() - t_start)
+                    print(f"\n--- FPS: {fps:.2f} ---")
+                    print(f"Camera Grab:   {accum_grab/frame_count*1000:.2f}ms")
+                    print(f"JPEG Compress: {accum_compress/frame_count*1000:.2f}ms")
+                    print(f"Network RTT:   {accum_net/frame_count*1000:.2f}ms")
+                    print(f"JPEG Decode:   {accum_decode/frame_count*1000:.2f}ms")
+                    print(f"Virtual Cam:   {accum_vcam/frame_count*1000:.2f}ms")
+                    print(f"GUI Preview:   {accum_preview/frame_count*1000:.2f}ms")
+                    print("----------------\n")
+                    
+                    frame_count = 0
+                    t_start = time.time()
+                    accum_grab = 0
+                    accum_compress = 0
+                    accum_net = 0
+                    accum_decode = 0
+                    accum_vcam = 0
+                    accum_preview = 0
                     
     except Exception as e:
         print(f"\nConnection with server interrupted: {e}")
