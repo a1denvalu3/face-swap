@@ -7,6 +7,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse
 import uvicorn
 import argparse
+import asyncio
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+import av
+from pydantic import BaseModel
 
 import insightface
 from insightface.app import FaceAnalysis
@@ -138,6 +142,89 @@ async def set_target_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         print(f"Error loading target face: {e}")
         return {"status": "error", "message": str(e)}
+
+pcs = set()
+
+class FaceSwapVideoTrack(MediaStreamTrack):
+    kind = "video"
+
+    def __init__(self, track):
+        super().__init__()
+        self.track = track
+
+    async def recv(self):
+        frame = await self.track.recv()
+        
+        global target_face_object, face_analyser, swapper
+        
+        if target_face_object is None or swapper is None or face_analyser is None:
+            return frame
+            
+        try:
+            # Convert av.VideoFrame to OpenCV BGR image
+            img = frame.to_ndarray(format="bgr24")
+            
+            # Run face-swapping
+            faces = face_analyser.get(img)
+            if len(faces) > 0:
+                swapped_img = img.copy()
+                for face in faces:
+                    swapped_img = swapper.get(swapped_img, face, target_face_object, paste_back=True)
+            else:
+                swapped_img = img
+                
+            # Convert swapped BGR image back to av.VideoFrame
+            new_frame = av.VideoFrame.from_ndarray(swapped_img, format="bgr24")
+            new_frame.pts = frame.pts
+            new_frame.time_base = frame.time_base
+            return new_frame
+        except Exception as e:
+            print(f"Error swapping frame in WebRTC track: {e}")
+            return frame
+
+class OfferModel(BaseModel):
+    sdp: str
+    type: str
+
+@app.post("/offer")
+async def webrtc_offer(params: OfferModel):
+    offer = RTCSessionDescription(sdp=params.sdp, type=params.type)
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+    
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"WebRTC Connection state is {pc.connectionState}")
+        if pc.connectionState in ["failed", "closed"]:
+            await pc.close()
+            pcs.discard(pc)
+            print("WebRTC connection closed.")
+            
+    @pc.on("track")
+    def on_track(track):
+        if track.kind == "video":
+            print("Received client's video track over WebRTC.")
+            swapped_track = FaceSwapVideoTrack(track)
+            pc.addTrack(swapped_track)
+            
+    # Set remote description
+    await pc.setRemoteDescription(offer)
+    
+    # Create SDP answer
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    
+    return {
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type
+    }
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # Close all peer connections on shutdown
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
 
 @app.websocket("/swap")
 async def websocket_endpoint(websocket: WebSocket):

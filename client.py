@@ -8,12 +8,16 @@ import sys
 import os
 import pyvirtualcam
 from urllib.parse import urlparse
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+import av
+import fractions
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Client for remote GPU accelerated face-swapping.")
     parser.add_argument("--server", type=str, default="localhost", help="IP address or domain of the remote GPU server.")
     parser.add_argument("--port", type=int, default=8000, help="Port of the remote GPU server.")
     parser.add_argument("--secure", action="store_true", help="Use secure HTTPS/WSS connections.")
+    parser.add_argument("--protocol", type=str, choices=["webrtc", "websockets"], default="webrtc", help="Streaming protocol to use: webrtc or websockets (default: webrtc).")
     parser.add_argument("--camera", type=int, default=0, help="Local webcam device index (default: 0).")
     parser.add_argument("--target", type=str, default="", help="Path to the local character image (JPEG/PNG) to swap with.")
     parser.add_argument("--width", type=int, default=640, help="Webcam capture width (default: 640).")
@@ -51,7 +55,7 @@ async def upload_target_face(url, image_path):
         print(f"CONNECTION ERROR during upload: {e}")
         return False
 
-async def streaming_loop(args, websocket_url):
+async def websocket_loop(args, websocket_url):
     # Set up OpenCV webcam capture
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -160,6 +164,162 @@ async def streaming_loop(args, websocket_url):
             pass
         print("Streaming closed. Cleanup complete.")
 
+class OpenCVVideoTrack(MediaStreamTrack):
+    kind = "video"
+
+    def __init__(self, cap, fps=30):
+        super().__init__()
+        self.cap = cap
+        self.fps = fps
+        self.time_base = fractions.Fraction(1, 90000)
+        self.pts = 0
+
+    async def recv(self):
+        # Enforce frame rate timing on capture
+        await asyncio.sleep(1.0 / self.fps)
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            # Create a black dummy frame if capture fails
+            h, w = 480, 640
+            frame = np.zeros((h, w, 3), dtype=np.uint8)
+            
+        # Convert OpenCV BGR frame to av.VideoFrame
+        av_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+        
+        # Calculate PTS
+        self.pts += int(90000 / self.fps)
+        av_frame.pts = self.pts
+        av_frame.time_base = self.time_base
+        
+        return av_frame
+
+async def display_swapped_track(track, vcam, args, stop_event):
+    try:
+        while not stop_event.is_set():
+            frame = await track.recv()
+            img = frame.to_ndarray(format="bgr24")
+            
+            # Write to system's Virtual Camera (requires RGB format)
+            if vcam is not None:
+                try:
+                    rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    vcam.send(rgb_frame)
+                    vcam.sleep_until_next_frame()
+                except Exception as e:
+                    print(f"Virtual camera write error: {e}")
+                    
+            # Render local preview window (requires BGR format)
+            if not args.no_preview:
+                try:
+                    cv2.imshow("Remote GPU Face-Swap Preview (WebRTC)", img)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("User closed the preview window.")
+                        stop_event.set()
+                        break
+                except cv2.error:
+                    print("\nWARNING: Local GUI preview window is not supported in this environment.")
+                    print("Disabling preview and running in background-only mode.")
+                    args.no_preview = True
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"Error displaying swapped track: {e}")
+
+async def webrtc_loop(args, offer_url):
+    # Set up OpenCV webcam capture
+    cap = cv2.VideoCapture(args.camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    
+    # Retrieve actual resolution set by OpenCV
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if actual_fps <= 0:
+        actual_fps = args.fps
+        
+    print(f"Webcam initialised: {actual_width}x{actual_height} @ {actual_fps} FPS")
+    
+    if not cap.isOpened():
+        print(f"ERROR: Could not open webcam index {args.camera}")
+        sys.exit(1)
+        
+    # Set up virtual camera
+    vcam = None
+    try:
+        vcam = pyvirtualcam.Camera(width=actual_width, height=actual_height, fps=actual_fps)
+        print(f"Virtual camera active: {vcam.device}")
+    except Exception as e:
+        print("\n" + "="*60)
+        print("WARNING: Could not initialize a virtual camera.")
+        print(f"Detail: {e}")
+        print("To output directly as a system camera feed:")
+        print(" - On Windows: Install OBS Studio or 'OBS Virtual Camera'.")
+        print(" - On Linux: Ensure 'v4l2loopback' is loaded: sudo modprobe v4l2loopback")
+        print("The program will continue using local preview window only.")
+        print("="*60 + "\n")
+        
+    pc = RTCPeerConnection()
+    
+    # Add client's webcam track
+    local_video = OpenCVVideoTrack(cap, fps=actual_fps)
+    pc.addTrack(local_video)
+    
+    stop_event = asyncio.Event()
+    
+    @pc.on("track")
+    def on_track(track):
+        if track.kind == "video":
+            print("Received face-swapped video track from server over WebRTC!")
+            asyncio.ensure_future(display_swapped_track(track, vcam, args, stop_event))
+            
+    # Create SDP offer
+    offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    
+    print(f"Connecting to face-swapping stream via WebRTC at {offer_url}...")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            payload = {
+                "sdp": pc.localDescription.sdp,
+                "type": pc.localDescription.type
+            }
+            response = await client.post(offer_url, json=payload)
+            
+            if response.status_code != 200:
+                print(f"ERROR: Failed to establish WebRTC connection. Server returned {response.status_code}")
+                return
+                
+            answer_data = response.json()
+            answer = RTCSessionDescription(sdp=answer_data["sdp"], type=answer_data["type"])
+            await pc.setRemoteDescription(answer)
+            print("WebRTC connection established successfully! Streaming started...")
+            print("Press 'q' in the preview window to exit.")
+            
+            # Keep running until stop event is set (e.g. 'q' pressed in preview window)
+            while not stop_event.is_set():
+                await asyncio.sleep(0.1)
+                
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"\nWebRTC session interrupted: {e}")
+    finally:
+        # Clean up resources
+        print("Closing connection...")
+        cap.release()
+        await pc.close()
+        if vcam is not None:
+            vcam.close()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        print("WebRTC streaming closed. Cleanup complete.")
+
 def resolve_urls(args):
     server_input = args.server
     
@@ -202,7 +362,11 @@ async def main():
             print("WARNING: Target face upload failed. Streaming anyway (will not swap until a target is set).")
             
     # Start the real-time webcam stream
-    await streaming_loop(args, ws_url)
+    if args.protocol == "webrtc":
+        offer_url = http_url.replace("/set_target", "/offer")
+        await webrtc_loop(args, offer_url)
+    else:
+        await websocket_loop(args, ws_url)
 
 if __name__ == "__main__":
     try:
