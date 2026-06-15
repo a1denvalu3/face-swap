@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ONNX Models & Large Assets
+*.onnx
+*.zip
+
+# Operating system files
+.DS_Store
+Thumbs.db
