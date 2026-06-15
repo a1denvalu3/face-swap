@@ -58,7 +58,8 @@ def startup_event():
     providers = []
     if 'CUDAExecutionProvider' in available_providers:
         providers.append('CUDAExecutionProvider')
-    providers.append('CPUExecutionProvider')
+    else:
+        providers.append('CPUExecutionProvider')
     print(f"Configuring models to use: {providers}")
     
     # Initialize InsightFace FaceAnalysis for face detection/landmark extraction
@@ -76,7 +77,7 @@ def startup_event():
                 print("Forcing GPU execution for the Face Swapper model...")
                 sess_options = ort.SessionOptions()
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                sess = ort.InferenceSession(MODEL_PATH, sess_options, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+                sess = ort.InferenceSession(MODEL_PATH, sess_options, providers=['CUDAExecutionProvider'])
                 swapper = insightface.model_zoo.get_model(MODEL_PATH, download=False, download_zip=False, session=sess)
             else:
                 swapper = insightface.model_zoo.get_model(MODEL_PATH, download=False, download_zip=False)

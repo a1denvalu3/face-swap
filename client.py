@@ -167,8 +167,15 @@ async def websocket_loop(args, websocket_url):
                     continue
                     
                 t2 = time.time()
+                # Resize frame to requested target stream size if webcam resolution is different
+                # This prevents network congestion on high-res cameras (like 720p/1080p fallback)
+                if frame.shape[1] != args.width or frame.shape[0] != args.height:
+                    stream_frame = cv2.resize(frame, (args.width, args.height), interpolation=cv2.INTER_AREA)
+                else:
+                    stream_frame = frame
+                    
                 # Compress the raw frame to JPEG to minimize upload upload bandwidth and latency
-                _, encoded_img = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                _, encoded_img = cv2.imencode('.jpg', stream_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 t3 = time.time()
                 accum_compress += (t3 - t2)
                 
@@ -186,11 +193,15 @@ async def websocket_loop(args, websocket_url):
                     # Decode swapped JPEG back to OpenCV frame
                     np_arr = np.frombuffer(response_data, dtype=np.uint8)
                     swapped_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                    t7 = time.time()
-                    accum_decode += (t7 - t6)
                     
                     if swapped_frame is None:
-                        swapped_frame = frame  # Fallback to original frame if decoding failed
+                        swapped_frame = stream_frame  # Fallback to original frame if decoding failed
+                    else:
+                        # Resize back to webcam's original size for the virtual camera output
+                        if swapped_frame.shape[1] != actual_width or swapped_frame.shape[0] != actual_height:
+                            swapped_frame = cv2.resize(swapped_frame, (actual_width, actual_height), interpolation=cv2.INTER_LINEAR)
+                    t7 = time.time()
+                    accum_decode += (t7 - t6)
                         
                 except Exception as e:
                     print(f"Stream frame transmission error: {e}")
