@@ -6,6 +6,7 @@ import onnxruntime as ort
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse
 import uvicorn
+import argparse
 
 import insightface
 from insightface.app import FaceAnalysis
@@ -188,6 +189,13 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"Error during WebSocket processing loop: {e}")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Remote GPU accelerated face-swapping server.")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to bind the server to (default: 0.0.0.0).")
+    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on (default: 8000).")
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    args = parse_args()
     # Host on 0.0.0.0 so external clients can connect to the port
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
