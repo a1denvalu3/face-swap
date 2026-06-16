@@ -60,7 +60,7 @@ class ThreadedCamera:
 
     def read(self):
         with self.read_lock:
-            frame = self.frame.copy() if self.frame is not None else None
+            frame = self.frame
             grabbed = self.grabbed
         return grabbed, frame
 

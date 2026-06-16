@@ -16,6 +16,18 @@ import time
 import insightface
 from insightface.app import FaceAnalysis
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Remote GPU accelerated face-swapping server.")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to bind the server to (default: 0.0.0.0).")
+    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on (default: 8000).")
+    parser.add_argument("--det-size", type=int, nargs=2, default=[640, 480], help="Face detection size width height (default: 640 480). Smaller is faster.")
+    # Use parse_known_args to be robust against extra arguments from wrappers
+    args, _ = parser.parse_known_args()
+    return args
+
+# Parse arguments at module level so they are globally accessible during startup and runtime
+args = parse_args()
+
 app = FastAPI(title="Remote GPU Face-Swap Service")
 
 # Model configuration
@@ -25,6 +37,7 @@ MODEL_PATH = "inswapper_128.onnx"
 # Global state
 target_face_object = None
 face_analyser = None
+target_analyser = None
 swapper = None
 
 def download_model_if_needed():
@@ -46,7 +59,7 @@ def download_model_if_needed():
 @app.on_event("startup")
 def startup_event():
     """Initialises models on application startup."""
-    global face_analyser, swapper
+    global face_analyser, target_analyser, swapper
     
     # Download the swapper model if missing
     download_model_if_needed()
@@ -55,19 +68,32 @@ def startup_event():
     available_providers = ort.get_available_providers()
     print("Available ONNX Providers on server:", available_providers)
     
+    # Optimize CUDA options if GPU is available
     providers = []
     if 'CUDAExecutionProvider' in available_providers:
-        providers.append('CUDAExecutionProvider')
+        # Enable CUDA provider with performance-enhancing options
+        cuda_options = {
+            'cudnn_conv_algo_search': 'DEFAULT', # Balances start speed and runtime speed
+            'arena_extend_strategy': 'kNextPowerOfTwo',
+            'do_copy_in_default_stream': True
+        }
+        providers.append(('CUDAExecutionProvider', cuda_options))
     else:
         providers.append('CPUExecutionProvider')
     print(f"Configuring models to use: {providers}")
     
-    # Initialize InsightFace FaceAnalysis for face detection/landmark extraction
-    # 'buffalo_l' is the standard high-quality face analysis pack
-    face_analyser = FaceAnalysis(name='buffalo_l', providers=providers)
-    # 640x640 is standard and handles webcam feeds beautifully
-    face_analyser.prepare(ctx_id=0, det_size=(640, 640))
-    print("Face Analyser ready.")
+    # Initialize InsightFace FaceAnalysis for face detection/landmark extraction (live swapping)
+    # We only load 'detection' for the webcam stream to minimize CPU/GPU load
+    face_analyser = FaceAnalysis(name='buffalo_l', providers=providers, allowed_modules=['detection'])
+    det_size_tuple = tuple(args.det_size)
+    face_analyser.prepare(ctx_id=0, det_size=det_size_tuple)
+    print(f"Face Analyser (detection-only, size {det_size_tuple}) ready.")
+    
+    # Initialize separate analyzer for processing the uploaded target face
+    # This requires 'recognition' to extract target face embeddings
+    target_analyser = FaceAnalysis(name='buffalo_l', providers=providers, allowed_modules=['detection', 'recognition'])
+    target_analyser.prepare(ctx_id=0, det_size=(640, 640))
+    print("Target Face Analyser (detection + recognition) ready.")
     
     # Initialize the swapper model
     if os.path.exists(MODEL_PATH):
@@ -124,10 +150,10 @@ async def home():
 @app.post("/set_target")
 async def set_target_endpoint(file: UploadFile = File(...)):
     """Receives an image, extracts face features, and sets it as the active face to swap to."""
-    global target_face_object, face_analyser
+    global target_face_object, target_analyser
     
-    if face_analyser is None:
-        return {"status": "error", "message": "Face analyser model is not initialised on the server."}
+    if target_analyser is None:
+        return {"status": "error", "message": "Target face analyser model is not initialised on the server."}
         
     try:
         contents = await file.read()
@@ -137,8 +163,8 @@ async def set_target_endpoint(file: UploadFile = File(...)):
         if img is None:
             return {"status": "error", "message": "Failed to decode the uploaded image file."}
             
-        # Detect faces in the target image
-        faces = face_analyser.get(img)
+        # Detect faces in the target image (requires detection + recognition, so we use target_analyser)
+        faces = target_analyser.get(img)
         if len(faces) == 0:
             return {"status": "error", "message": "No face could be detected in the provided image."}
             
@@ -154,6 +180,17 @@ async def set_target_endpoint(file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 pcs = set()
+
+def process_frame(img, face_analyser, swapper, target_face_object):
+    """Processes a single frame: detects faces and performs swapping on them in-place."""
+    if target_face_object is None or swapper is None or face_analyser is None:
+        return img
+        
+    faces = face_analyser.get(img)
+    if len(faces) > 0:
+        for face in faces:
+            img = swapper.get(img, face, target_face_object, paste_back=True)
+    return img
 
 class FaceSwapVideoTrack(MediaStreamTrack):
     kind = "video"
@@ -174,14 +211,8 @@ class FaceSwapVideoTrack(MediaStreamTrack):
             # Convert av.VideoFrame to OpenCV BGR image
             img = frame.to_ndarray(format="bgr24")
             
-            # Run face-swapping
-            faces = face_analyser.get(img)
-            if len(faces) > 0:
-                swapped_img = img.copy()
-                for face in faces:
-                    swapped_img = swapper.get(swapped_img, face, target_face_object, paste_back=True)
-            else:
-                swapped_img = img
+            # Run face-swapping in a separate thread to keep the event loop responsive
+            swapped_img = await asyncio.to_thread(process_frame, img, face_analyser, swapper, target_face_object)
                 
             # Convert swapped BGR image back to av.VideoFrame
             new_frame = av.VideoFrame.from_ndarray(swapped_img, format="bgr24")
@@ -263,16 +294,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_bytes(data)
                 continue
                 
-            # Detect faces on the webcam frame
-            faces = face_analyser.get(img)
-            
-            if len(faces) > 0:
-                # Swap every detected face with our target character face
-                swapped_img = img.copy()
-                for face in faces:
-                    swapped_img = swapper.get(swapped_img, face, target_face_object, paste_back=True)
-            else:
-                swapped_img = img
+            # Run face-swapping in a separate thread to keep the event loop responsive
+            swapped_img = await asyncio.to_thread(process_frame, img, face_analyser, swapper, target_face_object)
                 
             # Re-encode the swapped frame back to JPEG to minimize network payload size
             # Quality of 85 balances visual fidelity and payload size perfectly
@@ -286,13 +309,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"Error during WebSocket processing loop: {e}")
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Remote GPU accelerated face-swapping server.")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to bind the server to (default: 0.0.0.0).")
-    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on (default: 8000).")
-    return parser.parse_args()
-
 if __name__ == "__main__":
-    args = parse_args()
     # Host on 0.0.0.0 so external clients can connect to the port
     uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
