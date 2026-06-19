@@ -15,6 +15,7 @@ import time
 
 import insightface
 from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Remote GPU accelerated face-swapping server.")
@@ -181,15 +182,191 @@ async def set_target_endpoint(file: UploadFile = File(...)):
 
 pcs = set()
 
+def paste_back_frame(img, bgr_fake, aimg, M):
+    """Pastes the swapped face BGR image back onto the original frame using affine transformation."""
+    target_img = img
+    fake_diff = bgr_fake.astype(np.float32) - aimg.astype(np.float32)
+    fake_diff = np.abs(fake_diff).mean(axis=2)
+    fake_diff[:2, :] = 0
+    fake_diff[-2:, :] = 0
+    fake_diff[:, :2] = 0
+    fake_diff[:, -2:] = 0
+    
+    IM = cv2.invertAffineTransform(M)
+    img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
+    
+    bgr_fake = cv2.warpAffine(bgr_fake, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+    img_white = cv2.warpAffine(img_white, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+    fake_diff = cv2.warpAffine(fake_diff, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+    
+    img_white[img_white > 20] = 255
+    fthresh = 10
+    fake_diff[fake_diff < fthresh] = 0
+    fake_diff[fake_diff >= fthresh] = 255
+    img_mask = img_white
+    
+    mask_h_inds, mask_w_inds = np.where(img_mask == 255)
+    if len(mask_h_inds) == 0 or len(mask_w_inds) == 0:
+        return target_img
+        
+    mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
+    mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
+    mask_size = int(np.sqrt(mask_h * mask_w))
+    k = max(mask_size // 10, 10)
+    
+    kernel = np.ones((k, k), np.uint8)
+    img_mask = cv2.erode(img_mask, kernel, iterations=1)
+    
+    kernel = np.ones((2, 2), np.uint8)
+    fake_diff = cv2.dilate(fake_diff, kernel, iterations=1)
+    
+    k = max(mask_size // 20, 5)
+    kernel_size = (k, k)
+    blur_size = tuple(2 * i + 1 for i in kernel_size)
+    img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
+    
+    k = 5
+    kernel_size = (k, k)
+    blur_size = tuple(2 * i + 1 for i in kernel_size)
+    fake_diff = cv2.GaussianBlur(fake_diff, blur_size, 0)
+    
+    img_mask /= 255.0
+    fake_diff /= 255.0
+    
+    img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
+    fake_merged = img_mask * bgr_fake + (1.0 - img_mask) * target_img.astype(np.float32)
+    fake_merged = fake_merged.astype(np.uint8)
+    return fake_merged
+
+
+def process_batch(batch, face_analyser, swapper, target_face_object):
+    """Processes a batch of frames: decodes, performs batched face-swapping, and re-encodes to JPEG."""
+    decoded_frames = []
+    original_datas = []
+    
+    # 1. Decode JPEG frames
+    for frame_id, raw_bytes in batch:
+        np_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            decoded_frames.append(None)
+        else:
+            decoded_frames.append(img)
+        original_datas.append(raw_bytes)
+    
+    # 2. Collect all face swap jobs across the decoded frames
+    jobs = []
+    for idx, img in enumerate(decoded_frames):
+        if img is None:
+            continue
+        faces = face_analyser.get(img)
+        if len(faces) > 0:
+            for face in faces:
+                # Align and crop face
+                aimg, M = face_align.norm_crop2(img, face.kps, swapper.input_size[0])
+                blob = cv2.dnn.blobFromImage(aimg, 1.0 / swapper.input_std, swapper.input_size,
+                                              (swapper.input_mean, swapper.input_mean, swapper.input_mean), swapRB=True)
+                # Prepare latent
+                latent = target_face_object.normed_embedding.reshape((1, -1))
+                latent = np.dot(latent, swapper.emap)
+                latent /= np.linalg.norm(latent)
+                
+                jobs.append({
+                    'frame_idx': idx,
+                    'aimg': aimg,
+                    'M': M,
+                    'blob': blob,
+                    'latent': latent
+                })
+                
+    # 3. If we have jobs, perform batched GPU inference
+    if len(jobs) > 0:
+        try:
+            # Concatenate blobs and latents along the batch axis (axis=0)
+            blobs = np.concatenate([j['blob'] for j in jobs], axis=0)
+            latents = np.concatenate([j['latent'] for j in jobs], axis=0)
+            
+            # Single GPU call for the whole batch of faces!
+            preds = swapper.session.run(swapper.output_names, {
+                swapper.input_names[0]: blobs,
+                swapper.input_names[1]: latents
+            })[0]
+            
+            # Post-process and paste each swapped face back to its corresponding frame
+            for i, job in enumerate(jobs):
+                frame_idx = job['frame_idx']
+                img = decoded_frames[frame_idx]
+                
+                # Get the prediction for this face swap job
+                img_fake = preds[i].transpose((1, 2, 0))
+                bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:, :, ::-1]
+                
+                # Paste back onto the frame
+                decoded_frames[frame_idx] = paste_back_frame(img, bgr_fake, job['aimg'], job['M'])
+        except Exception as e:
+            print(f"Error during batched GPU face swapping: {e}")
+            # On failure, we fallback to original frames
+            
+    # 4. Re-encode the processed frames to JPEG
+    encoded_batch = []
+    for idx, (frame_id, raw_bytes) in enumerate(batch):
+        img = decoded_frames[idx]
+        if img is None:
+            encoded_batch.append((frame_id, raw_bytes))
+        else:
+            _, encoded_img = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            encoded_batch.append((frame_id, encoded_img.tobytes()))
+            
+    return encoded_batch
+
+
 def process_frame(img, face_analyser, swapper, target_face_object):
-    """Processes a single frame: detects faces and performs swapping on them in-place."""
+    """Processes a single frame: detects faces and performs swapping on them in-place with batched inference."""
     if target_face_object is None or swapper is None or face_analyser is None:
         return img
         
     faces = face_analyser.get(img)
-    if len(faces) > 0:
+    if len(faces) == 0:
+        return img
+        
+    jobs = []
+    for face in faces:
+        aimg, M = face_align.norm_crop2(img, face.kps, swapper.input_size[0])
+        blob = cv2.dnn.blobFromImage(aimg, 1.0 / swapper.input_std, swapper.input_size,
+                                      (swapper.input_mean, swapper.input_mean, swapper.input_mean), swapRB=True)
+        latent = target_face_object.normed_embedding.reshape((1,-1))
+        latent = np.dot(latent, swapper.emap)
+        latent /= np.linalg.norm(latent)
+        
+        jobs.append({
+            'aimg': aimg,
+            'M': M,
+            'blob': blob,
+            'latent': latent
+        })
+        
+    try:
+        blobs = np.concatenate([j['blob'] for j in jobs], axis=0)
+        latents = np.concatenate([j['latent'] for j in jobs], axis=0)
+        
+        preds = swapper.session.run(swapper.output_names, {
+            swapper.input_names[0]: blobs,
+            swapper.input_names[1]: latents
+        })[0]
+        
+        for i, job in enumerate(jobs):
+            img_fake = preds[i].transpose((1, 2, 0))
+            bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:, :, ::-1]
+            img = paste_back_frame(img, bgr_fake, job['aimg'], job['M'])
+    except Exception as e:
+        print(f"Error during batched face-swapping in process_frame: {e}")
+        # Fallback to sequential swapping on failure
         for face in faces:
-            img = swapper.get(img, face, target_face_object, paste_back=True)
+            try:
+                img = swapper.get(img, face, target_face_object, paste_back=True)
+            except Exception:
+                pass
+                
     return img
 
 class FaceSwapVideoTrack(MediaStreamTrack):
@@ -269,45 +446,125 @@ async def on_shutdown():
 
 @app.websocket("/swap")
 async def websocket_endpoint(websocket: WebSocket):
-    """Handles low-latency, real-time image swapping over a binary WebSocket connection."""
+    """Handles low-latency, real-time image swapping over a binary WebSocket connection using dynamic batching."""
     global target_face_object, face_analyser, swapper
     
     await websocket.accept()
     print("New client connected for live face-swapping.")
     
+    # Decouple receiver and sender to enable dynamic batching
+    input_queue = asyncio.Queue(maxsize=16)
+    output_queue = asyncio.Queue(maxsize=16)
+    
+    async def receiver_task():
+        frame_id = 0
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                await input_queue.put((frame_id, data))
+                frame_id += 1
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            print(f"WebSocket Receiver error: {e}")
+        finally:
+            # Signal the batcher to stop
+            await input_queue.put((None, None))
+
+    async def sender_task():
+        try:
+            next_send_id = 0
+            pending_sends = {}
+            
+            while True:
+                frame_id, encoded_data = await output_queue.get()
+                if frame_id is None:
+                    break
+                pending_sends[frame_id] = encoded_data
+                output_queue.task_done()
+                
+                while next_send_id in pending_sends:
+                    data_to_send = pending_sends.pop(next_send_id)
+                    await websocket.send_bytes(data_to_send)
+                    next_send_id += 1
+        except Exception as e:
+            print(f"WebSocket Sender error: {e}")
+
+    async def batcher_task():
+        MAX_BATCH_SIZE = 4
+        BATCH_TIMEOUT = 0.005  # 5ms wait to dynamically collect incoming frames
+        
+        try:
+            while True:
+                # Wait for the first frame in the next batch
+                frame_id, data = await input_queue.get()
+                if frame_id is None:
+                    await output_queue.put((None, None))
+                    input_queue.task_done()
+                    break
+                
+                batch = [(frame_id, data)]
+                input_queue.task_done()
+                
+                # Dynamic batching: try to gather up to MAX_BATCH_SIZE frames
+                start_time = time.time()
+                while len(batch) < MAX_BATCH_SIZE:
+                    time_remaining = BATCH_TIMEOUT - (time.time() - start_time)
+                    if time_remaining <= 0:
+                        break
+                    try:
+                        next_frame_id, next_data = await asyncio.wait_for(
+                            input_queue.get(), 
+                            timeout=max(0.001, time_remaining)
+                        )
+                        if next_frame_id is None:
+                            # Re-add Sentinel for shutdown sequence
+                            await input_queue.put((None, None))
+                            break
+                        batch.append((next_frame_id, next_data))
+                        input_queue.task_done()
+                    except asyncio.TimeoutError:
+                        break
+                
+                # If target_face_object or models are not loaded, bypass immediately
+                if target_face_object is None or swapper is None or face_analyser is None:
+                    for fid, d in batch:
+                        await output_queue.put((fid, d))
+                    continue
+                
+                # Offload processing to thread pool to avoid blocking the event loop
+                processed_batch = await asyncio.to_thread(
+                    process_batch, 
+                    batch, 
+                    face_analyser, 
+                    swapper, 
+                    target_face_object
+                )
+                
+                for fid, encoded_res in processed_batch:
+                    await output_queue.put((fid, encoded_res))
+                    
+        except Exception as e:
+            print(f"WebSocket Batcher error: {e}")
+            await output_queue.put((None, None))
+
+    # Run receiver, batcher, and sender concurrently
+    tasks = [
+        asyncio.create_task(receiver_task()),
+        asyncio.create_task(batcher_task()),
+        asyncio.create_task(sender_task())
+    ]
+    
     try:
-        while True:
-            # Receive compressed frame bytes from client
-            data = await websocket.receive_bytes()
-            
-            # If no target face is loaded, return the frame unmodified
-            if target_face_object is None or swapper is None or face_analyser is None:
-                await websocket.send_bytes(data)
-                continue
-                
-            # Decode JPEG frame
-            np_arr = np.frombuffer(data, dtype=np.uint8)
-            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            
-            if img is None:
-                # If decoding failed, send original bytes back
-                await websocket.send_bytes(data)
-                continue
-                
-            # Run face-swapping in a separate thread to keep the event loop responsive
-            swapped_img = await asyncio.to_thread(process_frame, img, face_analyser, swapper, target_face_object)
-                
-            # Re-encode the swapped frame back to JPEG to minimize network payload size
-            # Quality of 85 balances visual fidelity and payload size perfectly
-            _, encoded_img = cv2.imencode('.jpg', swapped_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            
-            # Send back the swapped frame as binary data
-            await websocket.send_bytes(encoded_img.tobytes())
-            
-    except WebSocketDisconnect:
-        print("Client disconnected from face-swapping feed.")
+        await asyncio.gather(*tasks)
     except Exception as e:
-        print(f"Error during WebSocket processing loop: {e}")
+        print(f"Error in WebSocket handler tasks: {e}")
+    finally:
+        # Cancel any remaining tasks to ensure no dangling tasks
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        print("Client disconnected from face-swapping feed.")
 
 if __name__ == "__main__":
     # Host on 0.0.0.0 so external clients can connect to the port
